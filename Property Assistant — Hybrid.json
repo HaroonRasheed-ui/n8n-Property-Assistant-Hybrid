@@ -1,0 +1,998 @@
+{
+  "name": "Property Assistant — Hybrid",
+  "nodes": [
+    {
+      "parameters": {
+        "public": true,
+        "options": {}
+      },
+      "id": "267879ff-d777-4c64-803d-3df0c0ee963d",
+      "name": "01 | Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -4720,
+        -608
+      ],
+      "webhookId": "property-assistant-hybrid"
+    },
+    {
+      "parameters": {
+        "jsCode": "const chatData = $input.first().json;\nconst sessionId = chatData.sessionId ?? chatData.session_id ?? 'default';\nconst chatInput = (chatData.chatInput ?? chatData.message ?? '').trim();\nconst lower = chatInput.toLowerCase();\n\nconst directMap = {'1':1,'one':1,'first':1,'2':2,'two':2,'second':2,'3':3,'three':3,'third':3};\nconst isSelection = directMap[lower] !== undefined;\nconst selectedIndex = isSelection ? directMap[lower] : null;\n\nconst greetRe = /^(hi|hello|hey|yo|sup|salam|good (morning|afternoon|evening))\\b[\\s,!.]*(how are you|how r u|hru|what'?s up|kya haal hai)?[\\s!.?]*$/i;\nconst thanksRe = /^(thanks|thank you|thx|shukriya)[\\s!.?]*$/i;\nconst isGreet = (greetRe.test(lower) || thanksRe.test(lower)) && !isSelection;\n\nconst resetWords = ['reset','start over','clear','new search','restart','clear filters'];\nconst isReset = resetWords.includes(lower);\n\nconst moreWords = ['more','show more','next','next 3','next page'];\nconst isMore = moreWords.includes(lower);\n\nconst skipAI = isSelection || isGreet || isReset || isMore;\nlet fastIntent = null;\nif (isSelection) fastIntent = 'show_detail';\nelse if (isGreet) fastIntent = 'greet';\nelse if (isReset) fastIntent = 'reset';\nelse if (isMore) fastIntent = 'show_more';\n\nreturn [{ json: { userMessage: chatInput, sessionId, skipAI, fastIntent, selectedIndex } }];"
+      },
+      "id": "fa994adc-8fc4-4629-9b03-543044d6e575",
+      "name": "02 | Parse Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4480,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COALESCE((SELECT state FROM sessions WHERE session_id = $1), '{}'::jsonb) AS state,\n  COALESCE((SELECT last_results FROM sessions WHERE session_id = $1), '[]'::jsonb) AS last_results,\n  COALESCE((SELECT city_cache FROM sessions WHERE session_id = $1), '{}'::jsonb) AS city_cache,\n  COALESCE((SELECT chat_history FROM sessions WHERE session_id = $1), '[]'::jsonb) AS chat_history,\n  COALESCE((SELECT result_offset FROM sessions WHERE session_id = $1), 0) AS result_offset",
+        "options": {
+          "queryReplacement": "={{ $json.sessionId }}"
+        }
+      },
+      "id": "3ff6b8b8-5d28-469b-ae81-f56fda005907",
+      "name": "03 | Read Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -4240,
+        -608
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "MwC1yijgmrukymoC",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const parseInput = $('02 | Parse Input').first().json;\nconst rows = $('03 | Read Session').all();\nconst row = rows.length > 0 ? rows[0].json : {};\nconst previousState = row?.state ?? {};\nconst lastResults = row?.last_results ?? [];\nconst cityCache = row?.city_cache ?? {};\nconst chatHistory = row?.chat_history ?? [];\nconst resultOffset = row?.result_offset ?? 0;\n\nconst sessionId = parseInput.sessionId;\nconst userMessage = parseInput.userMessage;\n\nif (parseInput.skipAI) {\n  return [{ json: { skipAI: true, fastIntent: parseInput.fastIntent, selectedIndex: parseInput.selectedIndex, previousState, lastResults, cityCache, chatHistory, resultOffset, sessionId, userMessage } }];\n}\n\nconst systemPrompt = `You are a smart real estate assistant with PERFECT memory.\n\nYOUR JOB:\n1. Read RECENT CONVERSATION and CURRENT STATE carefully - these are preferences already collected\n2. Extract NEW info from the user message\n3. Merge: keep ALL non-null state values, only update fields user explicitly mentions\n4. Output merged state + intent\n\nINTENT RULES:\n- greet: user says hi, hello, hey, thanks, or any small talk\n- search_property: property_type AND city are BOTH non-null in merged state\n- gather_info: property_type OR city is still null after merging\n- weather_query: user explicitly asks about weather or temperature\n- show_detail: user selects a result by number or ordinal\n- reset: user wants to start over, clear filters, or begin a new search\n\nPROPERTY TYPES (use exact spelling): Apartment, Villa, Studio, Condo, House\nSTUDIO RULE: if type is Studio, set bedrooms to 0\nPRICE: between X and Y => min_price:X max_price:Y | under X => max_price:X | at least X => min_price:X\nBEDROOMS: 2 bedroom => bedrooms:2\nCITY: always normalize (new york => New York, seattle => Seattle, lahore => Lahore)\n\nCRITICAL RULES:\n- ALWAYS copy ALL non-null fields from previous_state into updated_state FIRST\n- NEVER wipe a field unless user explicitly says to change it or asks to reset\n- For gather_info: still output all known fields, just set clarification_needed\n- For greet: set greeting_message to a warm short response\n- Amenities are NOT filterable: if mentioned set amenity_note, do not add to state\n\nOUTPUT - valid JSON only, no markdown:\n{\n  \"updated_state\": {\"property_type\": null, \"min_price\": null, \"max_price\": null, \"city\": null, \"state\": null, \"bedrooms\": null},\n  \"intent\": \"greet|search_property|gather_info|show_detail|weather_query|reset\",\n  \"selected_index\": null,\n  \"weather_city\": null,\n  \"clarification_needed\": null,\n  \"amenity_note\": null,\n  \"greeting_message\": null\n}`;\n\nconst historyText = chatHistory.slice(-6).map(h => h.role + ': ' + h.text).join('\\n');\nconst userPrompt = 'RECENT CONVERSATION:\\n' + (historyText || '(none)') + '\\n\\nCURRENT STATE:\\n' + JSON.stringify(previousState, null, 2) + '\\n\\nUser: \"' + userMessage + '\"\\n\\nReturn JSON only.';\n\nreturn [{ json: { skipAI: false, systemPrompt, userPrompt, previousState, lastResults, cityCache, chatHistory, resultOffset, sessionId, userMessage } }];"
+      },
+      "id": "9974c3e8-7f7b-4f03-a55e-1b4fe1e75835",
+      "name": "04 | Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4000,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skipAI }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "name": "filter.operator.true"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2a90f84f-dfc1-4b63-88c3-177249fcbe34",
+      "name": "05 | Skip AI?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -3760,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "llama-3.3-70b-versatile"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\": \"system\", \"content\": $json.systemPrompt}, {\"role\": \"user\", \"content\": $json.userPrompt}] }}"
+            },
+            {
+              "name": "response_format",
+              "value": "={{ {\"type\": \"json_object\"} }}"
+            },
+            {
+              "name": "temperature",
+              "value": "={{ 0 }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0f9a270c-89d0-4962-9f20-5a0944268a50",
+      "name": "06 | Groq Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -3520,
+        -384
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SB0gZM7bjhnVDVoQ",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const bp = $('04 | Build Prompt').first().json;\nconst inp = $input.first().json;\nconst previousState = bp.previousState ?? {};\nconst lastResults = bp.lastResults ?? [];\nconst cityCache = bp.cityCache ?? {};\nconst chatHistory = bp.chatHistory ?? [];\nconst resultOffset = bp.resultOffset ?? 0;\nconst sessionId = bp.sessionId;\nconst userMessage = bp.userMessage ?? '';\n\nfunction fallbackExtract(msg) {\n  const out = { updated_state: {}, intent: 'gather_info', clarification_needed: null };\n  const m = msg.toLowerCase();\n  const types = { apartment: 'Apartment', villa: 'Villa', studio: 'Studio', condo: 'Condo', house: 'House' };\n  for (const k in types) if (m.includes(k)) out.updated_state.property_type = types[k];\n  const bed = m.match(/(\\d+)\\s*(bed|bedroom|br)/);\n  if (bed) out.updated_state.bedrooms = Number(bed[1]);\n  const between = m.match(/between\\s*\\$?([\\d,]+)\\s*(?:and|-|to)\\s*\\$?([\\d,]+)/);\n  const under = m.match(/(?:under|below|max)\\s*\\$?([\\d,]+)/);\n  const over = m.match(/(?:at least|above|over|min)\\s*\\$?([\\d,]+)/);\n  if (between) {\n    out.updated_state.min_price = Number(between[1].replace(/,/g, ''));\n    out.updated_state.max_price = Number(between[2].replace(/,/g, ''));\n  } else {\n    if (under) out.updated_state.max_price = Number(under[1].replace(/,/g, ''));\n    if (over) out.updated_state.min_price = Number(over[1].replace(/,/g, ''));\n  }\n  const cityM = msg.match(/\\bin\\s+([A-Za-z][A-Za-z ]{1,30})/i);\n  if (cityM) out.updated_state.city = cityM[1].trim();\n  if (m.includes('weather') || m.includes('temperature')) out.intent = 'weather_query';\n  return out;\n}\n\n// FAST PATH: no AI was called\nif (bp.skipAI === true) {\n  const intent = bp.fastIntent;\n  let mergedState = { ...previousState };\n  let outResults = lastResults;\n  if (intent === 'reset') { mergedState = {}; outResults = []; }\n  return [{ json: {\n    intent,\n    selected_index: bp.selectedIndex ?? null,\n    weather_city: mergedState.city ?? null,\n    clarification_needed: null,\n    amenity_note: null,\n    greeting_message: null,\n    aiDown: false,\n    mergedState,\n    stateB64: Buffer.from(JSON.stringify(mergedState)).toString('base64'),\n    lastResults: outResults,\n    cityCache,\n    chatHistory,\n    resultOffset,\n    sessionId,\n    userMessage\n  } }];\n}\n\n// AI PATH (with regex fallback if Groq failed)\nlet parsed = {};\nlet aiDown = false;\nconst raw = inp.choices?.[0]?.message?.content ?? null;\nif (raw) {\n  try {\n    const clean = raw.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n    parsed = JSON.parse(clean);\n  } catch (e) {\n    parsed = fallbackExtract(userMessage);\n    aiDown = true;\n  }\n} else {\n  parsed = fallbackExtract(userMessage);\n  aiDown = true;\n}\n\nconst next = parsed.updated_state ?? {};\nlet mergedState = { ...previousState };\nfor (const k in next) {\n  if (next[k] !== null && next[k] !== undefined && next[k] !== '') mergedState[k] = next[k];\n}\nif (mergedState.city) {\n  mergedState.city = mergedState.city.split(',')[0].trim().replace(/\\b\\w/g, c => c.toUpperCase());\n}\nif (mergedState.property_type === 'Studio') mergedState.bedrooms = 0;\n\nlet intent = parsed.intent ?? 'gather_info';\nif (intent === 'gather_info' && mergedState.property_type && mergedState.city) intent = 'search_property';\n\nlet outResults = lastResults;\nif (intent === 'reset') { mergedState = {}; outResults = []; }\n\nreturn [{ json: {\n  intent,\n  selected_index: parsed.selected_index ?? null,\n  weather_city: parsed.weather_city ?? mergedState.city ?? null,\n  clarification_needed: parsed.clarification_needed ?? null,\n  amenity_note: parsed.amenity_note ?? null,\n  greeting_message: parsed.greeting_message ?? null,\n  aiDown,\n  mergedState,\n  stateB64: Buffer.from(JSON.stringify(mergedState)).toString('base64'),\n  lastResults: outResults,\n  cityCache,\n  chatHistory,\n  resultOffset: 0,\n  sessionId,\n  userMessage\n} }];"
+      },
+      "id": "fb21d864-990f-4d4d-bcca-1f2238f229e3",
+      "name": "07 | Parse + Merge State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3280,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sessions (session_id, state, last_results, city_cache, chat_history, result_offset, updated_at)\nVALUES ($1, convert_from(decode($2, 'base64'), 'UTF8')::jsonb, '[]'::jsonb, '{}'::jsonb, '[]'::jsonb, 0, NOW())\nON CONFLICT (session_id)\nDO UPDATE SET state = convert_from(decode($2, 'base64'), 'UTF8')::jsonb, updated_at = NOW()",
+        "options": {
+          "queryReplacement": "={{ $json.sessionId }},{{ $json.stateB64 }}"
+        }
+      },
+      "id": "c190fb45-c67b-4c20-9f69-f6896268827c",
+      "name": "08 | Save Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -3040,
+        -608
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "MwC1yijgmrukymoC",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiData = $('07 | Parse + Merge State').first().json;\nreturn [{ json: aiData }];"
+      },
+      "id": "a364ff5c-ba33-4a97-ab79-a47e6408b6ac",
+      "name": "08B | Pass Through",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2800,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "weather_query"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "WEATHER"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "search_property"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "SEARCH"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r3",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "gather_info"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "GATHER_INFO"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r4",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "show_detail"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "SHOW_DETAIL"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r5",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "greet"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "GREET"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r6",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "reset"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "RESET"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "r7",
+                    "leftValue": "={{ $json.intent }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "show_more"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "SHOW_MORE"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      },
+      "id": "c17c20e1-c532-4ba6-ac94-2f09f67e55d6",
+      "name": "09 | Intent Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -2560,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.openweathermap.org/data/2.5/weather",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.weather_city }}"
+            },
+            {
+              "name": "appid",
+              "value": "52d4da22a370e69acdb767073961554f"
+            },
+            {
+              "name": "units",
+              "value": "metric"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f7c5f01a-5332-4b0f-8206-731bd12c2b81",
+      "name": "10 | Weather API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2032,
+        -1440
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const w = $input.first().json;\nconst d = $('07 | Parse + Merge State').first().json;\nconst s = d.mergedState ?? {};\nif (!w || w.cod === undefined || Number(w.cod) !== 200) {\n  return [{ json: { output: 'Could not fetch weather' + (d.weather_city ? ' for ' + d.weather_city : '') + '. Try again with a city name, e.g. \"weather in Lahore\".' } }];\n}\nconst city = w.name || 'the city';\nconst temp = Math.round(w.main?.temp) ?? 'N/A';\nconst feels = Math.round(w.main?.feels_like) ?? 'N/A';\nconst desc = w.weather?.[0]?.description || 'N/A';\nconst hum = w.main?.humidity ?? 'N/A';\nconst wind = Math.round(w.wind?.speed) ?? 'N/A';\nlet ctx = '';\nif (s.property_type) {\n  ctx = '\\n\\nStill tracking your ' + s.property_type + ' search' + (s.city ? ' in ' + s.city : '') + ' — just say the word to continue!';\n}\nconst output = [\n  'Weather in ' + city, '',\n  'Temperature : ' + temp + '°C (feels like ' + feels + '°C)',\n  'Conditions  : ' + desc.charAt(0).toUpperCase() + desc.slice(1),\n  'Humidity    : ' + hum + '%',\n  'Wind        : ' + wind + ' m/s'\n].join('\\n') + ctx;\nreturn [{ json: { output } }];"
+      },
+      "id": "07f81507-0ecf-439e-8341-39d65f932e0d",
+      "name": "11 | Format Weather",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1792,
+        -1440
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst s = d.mergedState ?? {};\nconst cityCache = d.cityCache ?? {};\nconst amenityNote = d.amenity_note ?? null;\nconst TTL = 30 * 60 * 1000;\nconst now = Date.now();\nconst cacheKey = s.city ? s.city.toLowerCase().trim() : null;\nconst entry = cacheKey ? (cityCache[cacheKey] ?? null) : null;\nconst isFresh = entry && (now - entry.cachedAt) < TTL;\nreturn [{ json: {\n  hasCacheHit: !!isFresh,\n  cachedRecords: isFresh ? (entry.records ?? []) : [],\n  state: s,\n  cacheKey,\n  amenity_note: amenityNote,\n  cityCache\n} }];"
+      },
+      "id": "92abeef2-681a-4532-9add-ba30c95094a0",
+      "name": "12 | Check Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2272,
+        -736
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.hasCacheHit }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f3ab9817-3de0-49bb-8c2d-d17f4a3ce8c8",
+      "name": "13 | Cache Hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2080,
+        -864
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst s = data.state ?? {};\nlet recs = [...(data.cachedRecords ?? [])];\nif (s.property_type) recs = recs.filter(r => r.property_type === s.property_type);\nif (s.min_price != null) recs = recs.filter(r => Number(r.price) >= Number(s.min_price));\nif (s.max_price != null) recs = recs.filter(r => Number(r.price) <= Number(s.max_price));\nif (s.bedrooms != null) recs = recs.filter(r => Number(r.bedrooms) === Number(s.bedrooms));\nconst top10 = recs.sort((a, b) => Number(a.price) - Number(b.price)).slice(0, 10);\nreturn [{ json: { properties: top10, state: s, fromCache: true, amenity_note: data.amenity_note ?? null, cityCache: data.cityCache ?? {} } }];"
+      },
+      "id": "c1ce05b7-8f36-431a-8b61-88d7decbfc8f",
+      "name": "14 | Serve from Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1872,
+        -960
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, property_type, price, city, state, bedrooms, amenities\nFROM properties\nWHERE availability = true\n  AND property_type = $1\n  AND LOWER(city) = LOWER($2)\n  AND price >= $3::numeric\n  AND price <= $4::numeric\n  AND ($5::int = -1 OR bedrooms = $5::int)\nORDER BY price ASC\nLIMIT 10",
+        "options": {
+          "queryReplacement": "={{ $json.state.property_type }},{{ $json.state.city }},{{ $json.state.min_price ?? 0 }},{{ $json.state.max_price ?? 2147483647 }},{{ $json.state.bedrooms ?? -1 }}"
+        }
+      },
+      "id": "5af61378-015f-4051-8394-072452245100",
+      "name": "15 | DB Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1840,
+        -736
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "MwC1yijgmrukymoC",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cacheData = $('12 | Check Cache').first().json;\nconst s = cacheData.state ?? {};\nconst amenityNote = cacheData.amenity_note ?? null;\nconst cityCache = { ...(cacheData.cityCache ?? {}) };\nconst records = $input.all().map(i => i.json).filter(r => r && r.id);\nif (s.city && records.length > 0) {\n  const key = s.city.toLowerCase().trim();\n  cityCache[key] = { records, cachedAt: Date.now() };\n}\nreturn [{ json: { properties: records, state: s, fromCache: false, amenity_note: amenityNote, cityCache } }];"
+      },
+      "id": "f983ce31-03d2-40ec-82b4-e103328abf61",
+      "name": "16 | Store in Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1600,
+        -736
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('07 | Parse + Merge State').first().json;\nconst data = $input.first().json;\nconst props = data.properties ?? [];\nconst s = data.state ?? {};\nconst amenityNote = data.amenity_note ?? null;\nconst cityCache = data.cityCache ?? {};\n\nlet output;\nif (props.length === 0) {\n  const c = [\n    s.property_type,\n    s.city ? 'in ' + s.city : null,\n    s.bedrooms != null ? s.bedrooms + ' bedrooms' : null,\n    (s.min_price && s.max_price) ? '$' + Number(s.min_price).toLocaleString() + '-$' + Number(s.max_price).toLocaleString() : null\n  ].filter(Boolean).join(' ');\n  output = 'No matches found for ' + (c || 'your search') + '. Try adjusting your filters or type \"reset\" to start over.';\n} else {\n  const shown = props.slice(0, 3);\n  const total = props.length;\n  let intro = 'Found ' + total + ' ' + (s.property_type ? s.property_type + (total > 1 ? 's' : '') : 'propert' + (total > 1 ? 'ies' : 'y'));\n  if (s.city) intro += ' in ' + s.city;\n  if (s.bedrooms != null) intro += ' | ' + s.bedrooms + ' Bed';\n  if (s.min_price && s.max_price) intro += ' | $' + Number(s.min_price).toLocaleString() + '-$' + Number(s.max_price).toLocaleString();\n  if (data.fromCache) intro += ' (cached)';\n  const lines = shown.map((p, i) => {\n    const beds = Number(p.bedrooms) === 0 ? 'Studio' : p.bedrooms + ' Bed';\n    const amens = Array.isArray(p.amenities) && p.amenities.length ? p.amenities.join(', ') : 'N/A';\n    return (i + 1) + '. ' + p.property_type + ' — ' + p.city + ', ' + p.state + ' | $' + Number(p.price).toLocaleString() + '/mo | ' + beds + ' | Amenities: ' + amens;\n  });\n  output = intro + '\\n\\n' + lines.join('\\n');\n  if (amenityNote) output += '\\n\\nNote: ' + amenityNote;\n  output += '\\n\\nType 1, 2, or 3 to see full details.';\n  if (total > 3) output += \" Type 'more' for the next page.\";\n}\nif (d.aiDown) output += '\\n\\n(Quick mode: AI was busy, basic keyword matching used.)';\nreturn [{ json: { output, lastResults: props, cityCache, resultOffset: 0 } }];"
+      },
+      "id": "d58b3f5c-1d78-4b7f-8ccc-ee12a8803f84",
+      "name": "17 | Format Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1584,
+        -944
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('07 | Parse + Merge State').first().json;\nconst s = d.mergedState ?? {};\nconst clarification = d.clarification_needed ?? null;\nlet output;\nif (s.property_type && !s.city) {\n  output = 'Great choice! Which city are you looking for a ' + s.property_type + ' in?';\n} else if (!s.property_type && s.city) {\n  output = s.city + ' is a great area! What type of property are you looking for?\\n\\nApartment | Studio | Villa | House | Condo';\n} else {\n  output = clarification ?? 'What type of property are you looking for?\\n\\nApartment | Studio | Villa | House | Condo';\n}\nif (d.aiDown) output += '\\n\\n(Quick mode: AI was busy, basic keyword matching used.)';\nreturn [{ json: { output } }];"
+      },
+      "id": "78ef7214-e2b2-40a6-b63f-bc70116a8fcb",
+      "name": "20 | Gather Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2320,
+        -560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('07 | Parse + Merge State').first().json;\nconst lastResults = d.lastResults ?? [];\nconst offset = d.resultOffset ?? 0;\nconst idx = offset + ((d.selected_index ?? 1) - 1);\nif (lastResults.length === 0) {\n  return [{ json: { output: 'Please search for a property first, then type 1, 2, or 3 to see full details.' } }];\n}\nconst prop = lastResults[idx] ?? null;\nif (!prop) {\n  return [{ json: { output: 'Invalid selection. Please type 1, 2, or 3 from the listed results.' } }];\n}\nconst beds = Number(prop.bedrooms) === 0 ? 'Studio' : prop.bedrooms + ' Bedroom';\nconst amens = Array.isArray(prop.amenities) && prop.amenities.length ? prop.amenities.join(', ') : 'N/A';\nconst output = [\n  '--- Property Details ---', '',\n  prop.property_type + ' in ' + prop.city + ', ' + prop.state,\n  'Price     : $' + Number(prop.price).toLocaleString() + '/mo',\n  'Size      : ' + beds,\n  'Status    : Available',\n  'Amenities : ' + amens, '',\n  \"Want to search another city, type 'more' for other results, or 'reset' to start fresh?\"\n].join('\\n');\nreturn [{ json: { output } }];"
+      },
+      "id": "96c6cb87-7125-4fed-b210-c955caf51e45",
+      "name": "21 | Show Detail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2320,
+        -368
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('07 | Parse + Merge State').first().json;\nconst s = d.mergedState ?? {};\nlet output = d.greeting_message ?? 'Hello! I am your property assistant. Tell me what type of property you are looking for and which city!';\nif (s.property_type || s.city) {\n  output += '\\n\\nStill tracking: ' + [s.property_type, s.city ? 'in ' + s.city : null].filter(Boolean).join(' ') + '. Say the word to continue!';\n}\nreturn [{ json: { output } }];"
+      },
+      "id": "d1b6ffe0-8fa5-4256-97ec-8fa167746212",
+      "name": "22 | Greet",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2320,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { output: 'All filters cleared! Fresh start.\\n\\nWhat type of property are you looking for?\\n\\nApartment | Studio | Villa | House | Condo' } }];"
+      },
+      "id": "56b22f3d-a751-4200-8fa1-865c1e6d16eb",
+      "name": "23 | Reset Filters",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2320,
+        16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('07 | Parse + Merge State').first().json;\nconst lastResults = d.lastResults ?? [];\nconst newOffset = (d.resultOffset ?? 0) + 3;\nconst page = lastResults.slice(newOffset, newOffset + 3);\nif (lastResults.length === 0) {\n  return [{ json: { output: 'No active search. Tell me a property type and city first!', resultOffset: 0 } }];\n}\nif (page.length === 0) {\n  return [{ json: { output: 'No more results for this search. Try adjusting filters or a new city.', resultOffset: d.resultOffset ?? 0 } }];\n}\nconst lines = page.map((p, i) => {\n  const beds = Number(p.bedrooms) === 0 ? 'Studio' : p.bedrooms + ' Bed';\n  const amens = Array.isArray(p.amenities) && p.amenities.length ? p.amenities.join(', ') : 'N/A';\n  return (i + 1) + '. ' + p.property_type + ' — ' + p.city + ', ' + p.state + ' | $' + Number(p.price).toLocaleString() + '/mo | ' + beds + ' | Amenities: ' + amens;\n});\nlet output = 'More results (' + (newOffset + 1) + '-' + (newOffset + page.length) + ' of ' + lastResults.length + '):\\n\\n' + lines.join('\\n');\noutput += '\\n\\nType 1, 2, or 3 to see full details.';\nif (lastResults.length > newOffset + 3) output += \" Type 'more' for the next page.\";\nreturn [{ json: { output, resultOffset: newOffset } }];"
+      },
+      "id": "ba7cab22-09ea-4c67-9188-ddb54dce80ce",
+      "name": "24 | Show More",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2320,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('07 | Parse + Merge State').first().json;\nconst branch = $input.first().json;\nconst output = branch.output ?? 'Sorry, something went wrong. Please try again.';\nconst lastResults = branch.lastResults ?? d.lastResults ?? [];\nconst cityCache = branch.cityCache ?? d.cityCache ?? {};\nconst resultOffset = branch.resultOffset ?? d.resultOffset ?? 0;\n\nconst hist = [...(d.chatHistory ?? [])];\nif (d.userMessage) hist.push({ role: 'user', text: String(d.userMessage).slice(0, 300) });\nhist.push({ role: 'assistant', text: String(output).slice(0, 300) });\nconst chatHistory = hist.slice(-12);\n\nconst b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64');\n\nreturn [{ json: {\n  output,\n  sessionId: d.sessionId,\n  historyB64: b64(chatHistory),\n  lastResultsB64: b64(lastResults),\n  cityCacheB64: b64(cityCache),\n  resultOffset\n} }];"
+      },
+      "id": "704ae795-5e73-4730-b55b-137aed162e33",
+      "name": "30 | Finalize Turn",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1024,
+        -608
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sessions SET\n  chat_history = convert_from(decode($2, 'base64'), 'UTF8')::jsonb,\n  last_results = convert_from(decode($3, 'base64'), 'UTF8')::jsonb,\n  city_cache = convert_from(decode($4, 'base64'), 'UTF8')::jsonb,\n  result_offset = $5::int,\n  updated_at = NOW()\nWHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.sessionId }},{{ $json.historyB64 }},{{ $json.lastResultsB64 }},{{ $json.cityCacheB64 }},{{ $json.resultOffset }}"
+        }
+      },
+      "id": "099b12a0-946e-4d1d-b8bd-a017ca6029e3",
+      "name": "31 | Save Turn",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -784,
+        -608
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "MwC1yijgmrukymoC",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { output: $('30 | Finalize Turn').first().json.output } }];"
+      },
+      "id": "4eb69dd4-9bd6-4670-9745-374bc5ef24f6",
+      "name": "32 | Respond to Chat",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -544,
+        -608
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "01 | Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "02 | Parse Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 | Parse Input": {
+      "main": [
+        [
+          {
+            "node": "03 | Read Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03 | Read Session": {
+      "main": [
+        [
+          {
+            "node": "04 | Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 | Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "05 | Skip AI?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 | Skip AI?": {
+      "main": [
+        [
+          {
+            "node": "07 | Parse + Merge State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "06 | Groq Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 | Groq Call": {
+      "main": [
+        [
+          {
+            "node": "07 | Parse + Merge State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "07 | Parse + Merge State": {
+      "main": [
+        [
+          {
+            "node": "08 | Save Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "08 | Save Session": {
+      "main": [
+        [
+          {
+            "node": "08B | Pass Through",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "08B | Pass Through": {
+      "main": [
+        [
+          {
+            "node": "09 | Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 | Intent Router": {
+      "main": [
+        [
+          {
+            "node": "10 | Weather API",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "12 | Check Cache",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "20 | Gather Info",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "21 | Show Detail",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "22 | Greet",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "23 | Reset Filters",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "24 | Show More",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 | Weather API": {
+      "main": [
+        [
+          {
+            "node": "11 | Format Weather",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 | Format Weather": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 | Check Cache": {
+      "main": [
+        [
+          {
+            "node": "13 | Cache Hit?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "13 | Cache Hit?": {
+      "main": [
+        [
+          {
+            "node": "14 | Serve from Cache",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "15 | DB Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "14 | Serve from Cache": {
+      "main": [
+        [
+          {
+            "node": "17 | Format Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "15 | DB Query": {
+      "main": [
+        [
+          {
+            "node": "16 | Store in Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "16 | Store in Cache": {
+      "main": [
+        [
+          {
+            "node": "17 | Format Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "17 | Format Results": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "20 | Gather Info": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "21 | Show Detail": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "22 | Greet": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "23 | Reset Filters": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "24 | Show More": {
+      "main": [
+        [
+          {
+            "node": "30 | Finalize Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "30 | Finalize Turn": {
+      "main": [
+        [
+          {
+            "node": "31 | Save Turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "31 | Save Turn": {
+      "main": [
+        [
+          {
+            "node": "32 | Respond to Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "a19f3c5c-c096-4b9d-992f-f3e6b5a9a484",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "94334e2d77c2e31e77797d8979cf8371d331b9c03663f35ade81039ef25a7154"
+  },
+  "id": "GEBxAkQbqdF5Vgoo",
+  "tags": []
+}
